@@ -271,6 +271,80 @@ def _looks_like_formula(text: str) -> bool:
     return False
 
 
+def _absorb_formula_fragments(items: list[dict]) -> None:
+    """把緊鄰公式的短小片段也歸類為公式（就地修改 is_formula 旗標）。
+
+    置中的大型公式常被 OCR 拆成好幾個小框：分母（√dk）、括號、式號 (1)
+    這些含數學符號的片段判得出是公式，但**純字母的分子（例如 QKT）**
+    靠文字本身判斷不出來。它若被當一般文字處理，公式的分子會被 inpaint
+    抹掉、再蓋上一塊翻譯文字，整條公式就毀了。規則：不含空白的短片段
+    （≤12 字元），只要與任何公式框距離在一個行高以內，就視為公式的一部分
+    （完整保留、不翻譯）。被吸收的片段也加入公式集合，反覆直到穩定，
+    讓一條公式的所有碎片都能被串起來。
+    """
+    formulas = [it["box"] for it in items if it["is_formula"]]
+    if not formulas:
+        return
+    changed = True
+    while changed:
+        changed = False
+        for it in items:
+            text = it["original"].strip()
+            if it["is_formula"] or len(text) > 12 or " " in text:
+                continue
+            x0, y0, x1, y1 = it["box"]
+            h = y1 - y0
+            for fx0, fy0, fx1, fy1 in formulas:
+                margin = max(h, fy1 - fy0)
+                if (x0 - margin <= fx1 and fx0 - margin <= x1
+                        and y0 - margin <= fy1 and fy0 - margin <= y1):
+                    it["is_formula"] = True
+                    formulas.append(it["box"])
+                    changed = True
+                    break
+
+
+def _merge_overlapping_text(items: list[dict]) -> None:
+    """合併互相重疊的非公式文字區域（就地修改 items）。
+
+    段落中若嵌著比行高還高的行內公式（例如 1/√dk），OCR 會把同一段拆成
+    數個「框互相重疊」的群組；各自翻譯、各自貼回，譯文就會疊在一起變成
+    無法閱讀的一團。這裡把重疊面積超過較小框三成的文字框合併成一個區域：
+    框取聯集、原文依閱讀順序串接後一起翻譯。
+    """
+    changed = True
+    while changed:
+        changed = False
+        for i in range(len(items)):
+            a = items[i]
+            if a is None or a["is_formula"]:
+                continue
+            for j in range(i + 1, len(items)):
+                b = items[j]
+                if b is None or b["is_formula"]:
+                    continue
+                ax0, ay0, ax1, ay1 = a["box"]
+                bx0, by0, bx1, by1 = b["box"]
+                iw = min(ax1, bx1) - max(ax0, bx0)
+                ih = min(ay1, by1) - max(ay0, by0)
+                if iw <= 0 or ih <= 0:
+                    continue
+                min_area = min((ax1 - ax0) * (ay1 - ay0),
+                               (bx1 - bx0) * (by1 - by0))
+                if iw * ih < 0.3 * max(1, min_area):
+                    continue
+                first, second = (a, b) if (ay0, ax0) <= (by0, bx0) else (b, a)
+                a = items[i] = {
+                    "box": (min(ax0, bx0), min(ay0, by0),
+                            max(ax1, bx1), max(ay1, by1)),
+                    "original": f'{first["original"]} {second["original"]}',
+                    "is_formula": False,
+                }
+                items[j] = None
+                changed = True
+    items[:] = [it for it in items if it is not None]
+
+
 def _group_into_paragraphs(lines: list[dict]) -> list[list[dict]]:
     """Group OCR lines that form one flowing paragraph so they get
     translated together as a full sentence, instead of each fragment being
@@ -378,31 +452,40 @@ def detect_and_translate(
     #    translated with full sentence context; formula lines stay isolated.
     groups = _group_into_paragraphs(raw_lines)
 
-    target_code = normalize_target(target_language)
-    translator = GoogleTranslator(source=_google_source_lang(source_langs), target=target_code)
-
-    regions: list[Region] = []
+    # 3. 先整理出每個 group 的框、原文與公式旗標（翻譯延後），這樣才能先做
+    #    「公式碎片吸收」，避免把公式分子（如 QKT）當一般文字翻譯掉。
+    pending: list[dict] = []
     for group in groups:
-        is_formula = group[0].get("is_formula", False)
         xs0 = [ln["box"][0] for ln in group]
         ys0 = [ln["box"][1] for ln in group]
         xs1 = [ln["box"][2] for ln in group]
         ys1 = [ln["box"][3] for ln in group]
-        box = (min(xs0), min(ys0), max(xs1), max(ys1))
-        original = " ".join(ln["text"] for ln in group)
+        pending.append({
+            "box": (min(xs0), min(ys0), max(xs1), max(ys1)),
+            "original": " ".join(ln["text"] for ln in group),
+            "is_formula": group[0].get("is_formula", False),
+        })
 
-        if is_formula:
+    _absorb_formula_fragments(pending)
+    _merge_overlapping_text(pending)
+
+    target_code = normalize_target(target_language)
+    translator = GoogleTranslator(source=_google_source_lang(source_langs), target=target_code)
+
+    regions: list[Region] = []
+    for p in pending:
+        if p["is_formula"]:
             # Leave formulas completely untouched downstream: no inpaint,
             # no redraw (see is_formula handling in remove_text/paste_translations).
-            regions.append(Region(box=box, original=original,
-                                  translation=original, is_formula=True))
+            regions.append(Region(box=p["box"], original=p["original"],
+                                  translation=p["original"], is_formula=True))
             continue
 
         try:
-            translation = translator.translate(original) or original
+            translation = translator.translate(p["original"]) or p["original"]
         except Exception:  # noqa: BLE001 - fall back to original on failure
-            translation = original
-        regions.append(Region(box=box, original=original,
+            translation = p["original"]
+        regions.append(Region(box=p["box"], original=p["original"],
                               translation=translation.strip(), is_formula=False))
 
     return regions
@@ -534,68 +617,141 @@ def _region_text_mask(crop, pad: int, box_h: int):
 
 
 def remove_text(img: Image.Image, regions: list[Region]) -> Image.Image:
-    """Erase the original text (去除文字) by inpainting the full bounding boxes.
-    直接使用與 Notebook 相同的邏輯：將 OCR 的文字方塊轉為遮罩並膨脹，再送入 OpenCV 修復。
+    """Erase the original text (去除文字) by inpainting only the text *strokes*.
+
+    以前的做法是把整個 bounding box 填滿當遮罩，大面積矩形修復會把方塊邊界外
+    的深色像素（例如緊鄰的公式）暈染進來，留下灰色殘影。改用 `_region_text_mask`
+    只遮住筆畫本身，inpaint 便能從字距間的乾淨背景取樣，結果乾淨許多。
     """
     import cv2
     import numpy as np
 
-    # 1. 將 Pillow 影像轉換為 OpenCV 的 BGR 格式
     rgb = np.array(img.convert("RGB"))
     bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
     h, w = bgr.shape[:2]
-    
-    # 2. 建立一個與原圖一樣大小的黑底遮罩 (Mask)
+
     mask = np.zeros((h, w), dtype=np.uint8)
 
-    # 3. 將每個文字方塊（Bounding Box）直接填滿白色（公式區域跳過，保持原樣）
     for r in regions:
         if r.is_formula:
             continue
         x0, y0, x1, y1 = r.box
-        # 在遮罩上繪製填滿的矩形方塊
-        cv2.rectangle(mask, (x0, y0), (x1, y1), 255, -1)
+        box_h = y1 - y0
+        # 在方塊外圍留一圈 padding：一方面讓 `_region_text_mask` 有乾淨的邊界
+        # 環估計背景色，另一方面涵蓋 OCR 框略小時漏掉的筆畫毛邊。
+        pad = int(np.clip(box_h // 4, 4, 16))
+        cx0, cy0 = max(0, x0 - pad), max(0, y0 - pad)
+        cx1, cy1 = min(w, x1 + pad), min(h, y1 + pad)
+        fg = _region_text_mask(rgb[cy0:cy1, cx0:cx1], pad, box_h)
+        if fg is None:
+            # 裁切區域太小無法估計 → 退回整框遮罩
+            cv2.rectangle(mask, (x0, y0), (x1, y1), 255, -1)
+        else:
+            mask[cy0:cy1, cx0:cx1] = np.maximum(mask[cy0:cy1, cx0:cx1], fg)
 
-    # 4. 如果有偵測到任何文字，進行遮罩膨脹與影像修復
-    if mask.any():
-        # 建立一個 7x7 的結構元素進行膨脹，確保文字外圍的毛邊與陰影也被完整覆蓋
+    # 公式區域必須原封不動：鄰近段落的遮罩（含膨脹）若疊到公式上，
+    # inpaint 會毀掉公式的一部分並留下模糊污漬，這裡強制清除該範圍的遮罩。
+    formula_m = np.zeros((h, w), dtype=np.uint8)
+    for r in regions:
+        if r.is_formula:
+            x0, y0, x1, y1 = r.box
+            formula_m[max(0, y0):max(0, y1), max(0, x0):max(0, x1)] = 255
+    mask[formula_m > 0] = 0
+
+    # TELEA 修復會從遮罩「邊界」取樣：緊貼遮罩的公式深色筆畫（行內的
+    # 1/√dk、dk 等）會被暈進修復區，留下一條條拖影。修復前先把公式區域
+    # 暫時蓋成周圍背景色，全部修復完成後再把公式的原始像素貼回去。
+    work = bgr
+    if formula_m.any():
+        work = bgr.copy()
+        for r in regions:
+            if not r.is_formula:
+                continue
+            x0, y0, x1, y1 = r.box
+            x0, y0 = max(0, x0), max(0, y0)
+            x1, y1 = min(w, max(0, x1)), min(h, max(0, y1))
+            p = 4
+            strips = [bgr[max(0, y0 - p):y0, x0:x1], bgr[y1:y1 + p, x0:x1],
+                      bgr[y0:y1, max(0, x0 - p):x0], bgr[y0:y1, x1:x1 + p]]
+            ring = [s.reshape(-1, 3) for s in strips if s.size]
+            bg = (np.median(np.concatenate(ring), axis=0)
+                  if ring else np.array([255, 255, 255]))
+            work[y0:y1, x0:x1] = bg.astype(np.uint8)
+
+    radius = max(3, min(h, w) // 150)
+    cleaned_bgr = (cv2.inpaint(work, mask, radius, cv2.INPAINT_TELEA)
+                   if mask.any() else work)
+
+    # 清除品質檢查（無條件執行）：筆畫遮罩偶爾會低估粗筆畫（粗體標題最
+    # 常見），inpaint 後留下讀得出來的鬼影；極端情況下遮罩甚至可能全空。
+    # 逐區檢查修復結果，仍殘留高對比筆畫的區域退回「整框遮罩」再修一次
+    # （公式範圍照樣排除）。
+    retry = np.zeros((h, w), dtype=np.uint8)
+    for r in regions:
+        if r.is_formula:
+            continue
+        x0, y0 = max(0, r.box[0]), max(0, r.box[1])
+        x1, y1 = max(0, r.box[2]), max(0, r.box[3])
+        crop = cleaned_bgr[y0:y1, x0:x1]
+        keep = formula_m[y0:y1, x0:x1] == 0   # 殘留量不計入公式像素
+        if crop.size == 0 or not keep.any():
+            continue
+        c = crop.astype(np.int16)
+        local_bg = np.median(c.reshape(-1, 3), axis=0)
+        residual = float(((np.abs(c - local_bg).max(axis=2) > 60) & keep).mean())
+        if residual > 0.02:
+            cv2.rectangle(retry, (x0, y0), (x1, y1), 255, -1)
+
+    if retry.any():
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
-        mask = cv2.dilate(mask, kernel)
-        
-        # 執行 OpenCV Inpaint (此處使用 TELEA，你也可以換成腳本原本的 cv2.INPAINT_NS)
-        radius = max(3, min(h, w) // 150)
-        cleaned_bgr = cv2.inpaint(bgr, mask, radius, cv2.INPAINT_TELEA)
-        
-        # 將結果轉回 RGB
-        rgb = cv2.cvtColor(cleaned_bgr, cv2.COLOR_BGR2RGB)
+        retry = cv2.dilate(retry, kernel)
+        retry[formula_m > 0] = 0
+        cleaned_bgr = cv2.inpaint(cleaned_bgr, retry, radius, cv2.INPAINT_TELEA)
 
+    # 把公式的原始像素貼回（前面為了避免拖影暫時用背景色蓋住了）。
+    if formula_m.any():
+        cleaned_bgr[formula_m > 0] = bgr[formula_m > 0]
+
+    rgb = cv2.cvtColor(cleaned_bgr, cv2.COLOR_BGR2RGB)
     return Image.fromarray(rgb)
 
 
+# CJK 表意文字、假名、全形標點等「任意處皆可斷行」的字元。
+_CJK_CHAR = (
+    r"[⺀-〿぀-ヿ㐀-䶿一-鿿"
+    r"豈-﫿＀-￯]"
+)
+# 斷行單位：一個 CJK 字元自成一個單位；連續的非 CJK 非空白字元（英文單字、
+# 數字、符號）整串為一個單位。捕捉前面的空白以決定要不要補空格。
+_WRAP_TOKEN_RE = re.compile(rf"(\s*)({_CJK_CHAR}|(?:(?!{_CJK_CHAR})\S)+)")
+
+
 def _wrap(draw, text, font, max_w):
-    """Greedy word/char wrap so each line fits max_w. Returns (lines, h, w)."""
+    """Greedy wrap so each line fits max_w. Returns (lines, h, w).
+
+    Latin words stay whole and rejoin with a space; CJK characters may break
+    anywhere. Wrapping must be token-based, not "split on spaces if any":
+    a Chinese translation with an embedded Latin word (e.g. "…中間有一個
+    ReLU 啟用…") contains spaces, and space-splitting would treat each long
+    Chinese run as one unbreakable word — the font would then have to shrink
+    until that entire run fits on a single line.
+    """
     lines: list[str] = []
-    if " " in text:
-        cur = ""
-        for w in text.split():
-            trial = f"{cur} {w}".strip()
+    cur = ""
+    for sep, unit in _WRAP_TOKEN_RE.findall(text):
+        # 超過整行寬度的單一單位（超長英文字串等）退回逐字元硬切。
+        pieces = ([unit] if len(unit) <= 1
+                  or draw.textlength(unit, font=font) <= max_w else list(unit))
+        for i, piece in enumerate(pieces):
+            joint = " " if (sep and cur and i == 0) else ""
+            trial = cur + joint + piece
             if not cur or draw.textlength(trial, font=font) <= max_w:
                 cur = trial
             else:
                 lines.append(cur)
-                cur = w
-        if cur:
-            lines.append(cur)
-    else:
-        cur = ""
-        for ch in text:
-            if not cur or draw.textlength(cur + ch, font=font) <= max_w:
-                cur += ch
-            else:
-                lines.append(cur)
-                cur = ch
-        if cur:
-            lines.append(cur)
+                cur = piece
+    if cur:
+        lines.append(cur)
     if not lines:
         lines = [text]
 
