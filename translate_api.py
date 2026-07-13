@@ -16,7 +16,7 @@ Pipeline
    translated text fitted into the original box.
 
 Run:
-    uvicorn main:app --reload --port 8000
+    uvicorn translate_api:app --reload --port 8000
 
 Then open http://localhost:8000/ for a small test page.
 
@@ -29,6 +29,7 @@ Notes
 
 from __future__ import annotations
 
+import base64
 import io
 import os
 import re
@@ -546,8 +547,6 @@ def detect_and_translate(
 ) -> list[Region]:
     """OCR the image, group lines into paragraphs (formulas excluded), then
     translate each group and return regions in pixel coords."""
-    import numpy as np
-
     reader = get_reader(_paddle_lang(source_langs))
     base = img.convert("RGB")
 
@@ -656,9 +655,6 @@ def _pick_font_path(target_language: str, bold: bool = False) -> str:
 
 def _text_stroke_color(img: Image.Image, box) -> tuple[int, int, int]:
     """Average colour of the darker/lighter stroke pixels = original text colour."""
-    import cv2
-    import numpy as np
-
     x0, y0, x1, y1 = box
     crop = np.array(img.convert("RGB").crop((x0, y0, x1, y1)))
     if crop.size == 0:
@@ -682,9 +678,6 @@ def _estimate_bold(img: Image.Image, box) -> bool:
         avoids ascenders/descenders skewing the ratio;
       * ink coverage — bold glyphs fill more of their footprint.
     """
-    import cv2
-    import numpy as np
-
     x0, y0, x1, y1 = box
     crop = np.array(img.convert("RGB").crop((x0, y0, x1, y1)))
     if crop.size == 0:
@@ -707,8 +700,6 @@ def _estimate_bg_color(img: Image.Image, box) -> tuple[int, int, int]:
 
     Call this on the *cleaned* image so the original strokes don't skew it.
     """
-    import numpy as np
-
     x0, y0, x1, y1 = box
     crop = np.array(img.convert("RGB").crop((x0, y0, x1, y1)))
     if crop.size == 0:
@@ -736,9 +727,6 @@ def _region_text_mask(crop, pad: int, box_h: int):
     the crop's border ring and mark any pixel that differs from it — so it works
     regardless of text colour, contrast, or how much of the box the text fills.
     """
-    import cv2
-    import numpy as np
-
     ch, cw = crop.shape[:2]
     if ch < 3 or cw < 3:
         return None
@@ -773,8 +761,6 @@ def _uniform_bg_color(crop, pad: int, box_h: int):
     paste 階段便會看到淺色背景、保留原本的字色。判定方式：文字以外的背景
     像素若顏色夠一致（標準差低），即視為純色色塊。
     """
-    import numpy as np
-
     fg = _region_text_mask(crop, pad, box_h)
     if fg is None:
         return None
@@ -797,8 +783,6 @@ def _gradient_fill(rgb, box):
     TELEA 會把邊緣顏色往內暈成塊狀接縫，純色填滿又會在漸層上留一塊平板。
     改用「取框上下方各數列乾淨背景，逐列垂直內插」重建漸層，銜接自然。
     """
-    import numpy as np
-
     h, w = rgb.shape[:2]
     x0, y0, x1, y1 = max(0, box[0]), max(0, box[1]), min(w, box[2]), min(h, box[3])
     bw, bh = x1 - x0, y1 - y0
@@ -836,9 +820,6 @@ def remove_text(img: Image.Image, regions: list[Region]) -> Image.Image:
         像素暈染成殘影。
       * 公式或品牌 logo（`_untouched`）→ 完全不動。
     """
-    import cv2
-    import numpy as np
-
     rgb = np.array(img.convert("RGB"))
     bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
     h, w = bgr.shape[:2]
@@ -1205,7 +1186,7 @@ async def translate(
 
     try:
         regions = detect_and_translate(pil, target_language, src)
-    except ValueError as exc:  # e.g. unsupported EasyOCR language combo
+    except ValueError as exc:  # e.g. unsupported language selection
         raise HTTPException(400, str(exc)) from exc
 
     out = render(pil, regions, target_language)
@@ -1214,7 +1195,6 @@ async def translate(
     png = buf.getvalue()
 
     if response_format == "json":
-        import base64
         return JSONResponse({
             "target_language": target_language,
             "regions": [
@@ -1236,8 +1216,6 @@ async def steps(
                                          # and Google Translate's source language
 ):
     """Return every intermediate stage of the pipeline as base64 PNGs."""
-    import base64
-
     data = await image.read()
     if not data:
         raise HTTPException(400, "Empty image upload.")
