@@ -136,6 +136,15 @@ class Region:
                                # typeset subscripts/superscripts, so the
                                # safest treatment for a real formula is to
                                # not touch it at all.
+    keep: bool = False         # True → brand/logo (e.g. a magazine masthead)
+                               # we deliberately don't translate; treated like
+                               # a formula for pixels — kept exactly as-is so
+                               # the stylised original logo is preserved.
+
+
+def _untouched(r: "Region") -> bool:
+    """Region whose original pixels must be preserved (formula or kept logo)."""
+    return r.is_formula or r.keep
 
 
 # Map our source-language codes to a PaddleOCR recognition model. PaddleOCR
@@ -266,9 +275,20 @@ def _looks_like_formula(text: str) -> bool:
     letters = sum(ch.isalpha() for ch in t)
     if letters == 0:                            # no letters at all → digits/symbols only
         return True
-    if len(t) < 60 and (1 - letters / len(t)) > 0.35:  # high symbol/digit ratio
+    # 高符號/數字比例 → 公式。但這條只適用於「幾乎沒有真實單字」的行:
+    # 雜誌副標常見「2050's Power Icons: Style,」「Science: Your 2050」這種
+    # 含年份與冒號的正常語句,數字+標點一多就會被誤判成公式而整行不翻譯。
+    # 走到這裡代表前面沒驗出任何數學符號/下標記號,所以只要有 ≥3 個真實
+    # 單字就視為語句;比例也改以非空白字元計,不讓空格灌水撐高分母。
+    if len(word_tokens) >= 3:
+        return False
+    compact = re.sub(r"\s+", "", t)
+    if len(compact) < 60 and (1 - letters / max(1, len(compact))) > 0.35:
         return True
     return False
+
+
+_STRONG_MATH_RE = re.compile(r"[=<>≤≥≈∑∏∫√±×÷∂∇]")
 
 
 def _absorb_formula_fragments(items: list[dict]) -> None:
@@ -278,12 +298,23 @@ def _absorb_formula_fragments(items: list[dict]) -> None:
     這些含數學符號的片段判得出是公式，但**純字母的分子（例如 QKT）**
     靠文字本身判斷不出來。它若被當一般文字處理，公式的分子會被 inpaint
     抹掉、再蓋上一塊翻譯文字，整條公式就毀了。規則：不含空白的短片段
-    （≤12 字元），只要與任何公式框距離在一個行高以內，就視為公式的一部分
-    （完整保留、不翻譯）。被吸收的片段也加入公式集合，反覆直到穩定，
-    讓一條公式的所有碎片都能被串起來。
+    （≤12 字元），若緊貼著一個公式「錨點」，就視為公式的一部分（完整保
+    留、不翻譯）。被吸收的片段也加入錨點集合，反覆直到穩定。
+
+    兩道防呆，避免在雜誌封面上連鎖誤吸：
+      * 錨點必須有**明確的數學證據**（=、√ 等運算子、函數名、下標變數）。
+        `30+`、`#1`、`ISSN 2002-4401` 這類純數字符號的版面元素雖自身判為
+        公式（保留它們沒錯），但不能當錨點——否則封面上緊鄰的大字
+        （ELON、TECH…）會一個接一個被連鎖吸收成「公式」而整塊不翻譯。
+      * 鄰接距離從「一個行高」收緊為「較小框高的 0.6 倍」。雜誌大字的行
+        高極大，舊 margin 會把半個版面外的字都算成「緊鄰」。
     """
-    formulas = [it["box"] for it in items if it["is_formula"]]
-    if not formulas:
+    def _strong(text: str) -> bool:
+        return bool(_STRONG_MATH_RE.search(text) or _FORMULA_FUNC_RE.search(text)
+                    or _SUBSCRIPT_VAR_RE.search(text))
+
+    anchors = [it["box"] for it in items if it["is_formula"] and _strong(it["original"])]
+    if not anchors:
         return
     changed = True
     while changed:
@@ -294,14 +325,52 @@ def _absorb_formula_fragments(items: list[dict]) -> None:
                 continue
             x0, y0, x1, y1 = it["box"]
             h = y1 - y0
-            for fx0, fy0, fx1, fy1 in formulas:
-                margin = max(h, fy1 - fy0)
+            for fx0, fy0, fx1, fy1 in anchors:
+                margin = max(2, int(0.6 * min(h, fy1 - fy0)))
                 if (x0 - margin <= fx1 and fx0 - margin <= x1
                         and y0 - margin <= fy1 and fy0 - margin <= y1):
                     it["is_formula"] = True
-                    formulas.append(it["box"])
+                    anchors.append(it["box"])
                     changed = True
                     break
+
+
+def _dedup_overlapping_lines(lines: list[dict]) -> None:
+    """去掉 OCR 對同一行文字的重複偵測（就地修改 lines）。
+
+    高召回的偵測設定（放大畫布、低門檻）偶爾會對同一行字回報兩個高度
+    重疊的框：一個完整、一個殘缺（例如「THE #1 SECRET TO」與「RET TO」）。
+    兩個都留著，殘缺版的碎句會混進段落，翻譯就變得支離破碎。
+
+    規則：兩框交集面積佔較小框六成以上 → 視為同一行的重複，保留辨識
+    信心較高者；信心相近（差 ≤ 0.05）時保留字數較多（較完整）的那個。
+    """
+    def _better(a: dict, b: dict) -> dict:
+        if abs(a["conf"] - b["conf"]) > 0.05:
+            return a if a["conf"] > b["conf"] else b
+        return a if len(a["text"]) >= len(b["text"]) else b
+
+    for i in range(len(lines)):
+        if lines[i] is None:
+            continue
+        for j in range(i + 1, len(lines)):
+            if lines[i] is None or lines[j] is None:
+                continue
+            ax0, ay0, ax1, ay1 = lines[i]["box"]
+            bx0, by0, bx1, by1 = lines[j]["box"]
+            iw = min(ax1, bx1) - max(ax0, bx0)
+            ih = min(ay1, by1) - max(ay0, by0)
+            if iw <= 0 or ih <= 0:
+                continue
+            min_area = min((ax1 - ax0) * (ay1 - ay0), (bx1 - bx0) * (by1 - by0))
+            if iw * ih < 0.6 * max(1, min_area):
+                continue
+            winner = _better(lines[i], lines[j])
+            if winner is lines[i]:
+                lines[j] = None
+            else:
+                lines[i] = None
+    lines[:] = [ln for ln in lines if ln is not None]
 
 
 def _merge_overlapping_text(items: list[dict]) -> None:
@@ -333,16 +402,77 @@ def _merge_overlapping_text(items: list[dict]) -> None:
                                (bx1 - bx0) * (by1 - by0))
                 if iw * ih < 0.3 * max(1, min_area):
                     continue
+                # 字級差很多的兩塊不合併：避免大標題（如「MODERN CLASSIC」）
+                # 把底下的小字副標吸進來一起翻譯、被縮成一小團。此合併原意是
+                # 接回「被行內公式切開的同一段」，那種情況兩塊「單行字級」相近
+                # ——用單行高度（line_h）而非整框高度判斷，才不會把「三行段落
+                # ＋一行段落」這種同字級、不同框高的正常情況也擋掉。
+                alh = a.get("line_h") or (ay1 - ay0)
+                blh = b.get("line_h") or (by1 - by0)
+                if max(alh, blh) > 1.6 * max(1, min(alh, blh)):
+                    continue
                 first, second = (a, b) if (ay0, ax0) <= (by0, bx0) else (b, a)
                 a = items[i] = {
                     "box": (min(ax0, bx0), min(ay0, by0),
                             max(ax1, bx1), max(ay1, by1)),
                     "original": f'{first["original"]} {second["original"]}',
                     "is_formula": False,
+                    "line_h": max(alh, blh),
                 }
                 items[j] = None
                 changed = True
     items[:] = [it for it in items if it is not None]
+
+
+def _mark_mastheads(items: list[dict], img_w: int, img_h: int) -> None:
+    """就地標記「品牌刊名／logo」區塊為 keep=True（不翻譯、原樣保留）。
+
+    雜誌刊名（PSYCHOLOGIES、VOGUE…）屬於品牌名，慣例不翻譯；而且它是特製
+    的美術字，重繪成一般字型只會更醜，所以最好整塊保留原始像素。
+
+    判定條件刻意保守，避免誤傷該翻譯的一般標題（例如論文的章節標題）：
+      * 位於畫面最上方（前 22%）
+      * 字很大（框高 ≥ 畫面高 4.5%，或達到全圖最高文字行的八成）
+      * 單一詞（不含空白）且以字母為主 → 章節標題多為多字詞，不會中標
+      * 全大寫或首字母大寫（品牌名常見寫法）
+
+    字母下限設 2 而非 3：風格化刊名常被人物/物件擋住一部分，OCR 只抓到
+    殘存的兩個字母（例如 VOGUE 只偵測到「UE」）。這種碎片若不保護，會被
+    inpaint 抹掉再用普通字型重畫，毀掉刊名。其餘條件（頂部、巨大、單詞、
+    全大寫）已足夠避免誤把一般短字保護起來。
+    """
+    text_items = [it for it in items if not it["is_formula"]]
+    if not text_items:
+        return
+    tallest = max((it["box"][3] - it["box"][1]) for it in text_items)
+    for it in text_items:
+        text = it["original"].strip()
+        x0, y0, x1, y1 = it["box"]
+        h = y1 - y0
+        letters = sum(ch.isalpha() for ch in text)
+        if (y0 < 0.22 * img_h
+                and (h >= 0.045 * img_h or h >= 0.8 * tallest)
+                and " " not in text
+                and letters >= 2 and letters >= 0.7 * len(text)
+                and (text.isupper() or text.istitle())):
+            it["keep"] = True
+
+
+def _plausible_text(text: str, conf: float) -> bool:
+    """過濾 OCR 誤偵測。
+
+    圖片紋理(嘴唇、飾品高光、布料摺痕)常被偵測成一小框、辨識出無意義的
+    短字串——若不濾掉,它會被翻譯後貼回照片上(例如嘴唇上出現譯文)。
+    真實文字的辨識分數通常 > 0.85,紋理誤判多落在 0.3–0.7,因此:
+      * 整體信心 < 0.5 → 捨棄(原本的 0.2 過於寬鬆)
+      * 極短字串(字母/數字 ≤ 3 個)幾乎涵蓋所有紋理誤判 → 要求更高信心
+    """
+    if conf < 0.5:
+        return False
+    alnum = sum(ch.isalnum() for ch in text)
+    if alnum <= 3 and conf < 0.75:
+        return False
+    return True
 
 
 def _group_into_paragraphs(lines: list[dict]) -> list[list[dict]]:
@@ -358,13 +488,19 @@ def _group_into_paragraphs(lines: list[dict]) -> list[list[dict]]:
 
     A line only joins the paragraph above it when ALL of these hold:
       * neither line is formula-like
-      * the vertical gap to the previous line is small relative to that
-        line's own height (ordinary line spacing, not a gap between
-        unrelated blocks/paragraphs)
+      * the vertical gap to the previous line is small relative to the
+        SMALLER of the two line heights (ordinary line spacing, not a gap
+        between unrelated blocks/paragraphs). Normalising by the smaller
+        height — not the average — matters: a large title averaged with a
+        small subtitle inflates the tolerance so much that the deliberate
+        whitespace band under a title reads as "normal line spacing" and the
+        subtitle gets glued on.
       * the two lines' horizontal ranges overlap substantially (same
         column/block — stops an unrelated sidebar element from merging in)
       * the two lines have similar height (same font size — stops a large
-        title merging with body text underneath it)
+        title merging with the smaller subtitle/body underneath it). Magazine
+        titles are often only ~1.4–1.5× their subtitle, so the threshold has
+        to be tight (a loose 1.6 lets "STYLE REPORT" swallow its subtitles).
     """
     ordered = sorted(lines, key=lambda l: (l["box"][1], l["box"][0]))  # reading order
 
@@ -384,16 +520,16 @@ def _group_into_paragraphs(lines: list[dict]) -> list[list[dict]]:
         x0, y0, x1, y1 = line["box"]
         px0, py0, px1, py1 = prev["box"]
         h, ph = (y1 - y0), (py1 - py0)
-        avg_h = (h + ph) / 2 or 1
+        min_h = max(1, min(h, ph))
 
         vertical_gap = y0 - py1
-        height_ratio = max(h, ph) / max(1, min(h, ph))
+        height_ratio = max(h, ph) / min_h
         overlap = min(x1, px1) - max(x0, px0)
         overlap_ratio = overlap / max(1, min(x1 - x0, px1 - px0))
 
         same_paragraph = (
-            vertical_gap < 0.7 * avg_h
-            and height_ratio < 1.6
+            vertical_gap < 0.6 * min_h
+            and height_ratio < 1.4
             and overlap_ratio > 0.3
         )
 
@@ -436,17 +572,22 @@ def detect_and_translate(
     raw_lines: list[dict] = []
     for text, conf, poly in zip(texts, scores, polys):
         text = (text or "").strip()
-        if not text or conf < 0.2:
+        if not text or not _plausible_text(text, conf):
             continue
         pts = np.asarray(poly) / scale
         x0, y0 = int(pts[:, 0].min()), int(pts[:, 1].min())
         x1, y1 = int(pts[:, 0].max()), int(pts[:, 1].max())
         if x1 - x0 < 2 or y1 - y0 < 2:
             continue
-        raw_lines.append({"text": text, "box": (x0, y0, x1, y1)})
+        raw_lines.append({"text": text, "box": (x0, y0, x1, y1),
+                          "conf": float(conf)})
 
     if not raw_lines:
         return []
+
+    # 1b. 同一行字被重複偵測(一完整、一殘缺)時只留一個,殘缺碎句
+    #     才不會混進段落把翻譯攪碎。
+    _dedup_overlapping_lines(raw_lines)
 
     # 2. Group consecutive natural-language lines into paragraphs so they get
     #    translated with full sentence context; formula lines stay isolated.
@@ -460,25 +601,31 @@ def detect_and_translate(
         ys0 = [ln["box"][1] for ln in group]
         xs1 = [ln["box"][2] for ln in group]
         ys1 = [ln["box"][3] for ln in group]
+        line_hs = sorted(ln["box"][3] - ln["box"][1] for ln in group)
         pending.append({
             "box": (min(xs0), min(ys0), max(xs1), max(ys1)),
             "original": " ".join(ln["text"] for ln in group),
             "is_formula": group[0].get("is_formula", False),
+            "keep": False,
+            "line_h": line_hs[len(line_hs) // 2],   # 單行字級（中位數）
         })
 
     _absorb_formula_fragments(pending)
     _merge_overlapping_text(pending)
+    _mark_mastheads(pending, base.width, base.height)
 
     target_code = normalize_target(target_language)
     translator = GoogleTranslator(source=_google_source_lang(source_langs), target=target_code)
 
     regions: list[Region] = []
     for p in pending:
-        if p["is_formula"]:
-            # Leave formulas completely untouched downstream: no inpaint,
-            # no redraw (see is_formula handling in remove_text/paste_translations).
+        if p["is_formula"] or p.get("keep"):
+            # Formulas and brand mastheads are left completely untouched
+            # downstream: no translation, no inpaint, no redraw (see the
+            # _untouched() handling in remove_text / paste_translations).
             regions.append(Region(box=p["box"], original=p["original"],
-                                  translation=p["original"], is_formula=True))
+                                  translation=p["original"],
+                                  is_formula=p["is_formula"], keep=p.get("keep", False)))
             continue
 
         try:
@@ -616,12 +763,78 @@ def _region_text_mask(crop, pad: int, box_h: int):
     return fg
 
 
-def remove_text(img: Image.Image, regions: list[Region]) -> Image.Image:
-    """Erase the original text (去除文字) by inpainting only the text *strokes*.
+def _uniform_bg_color(crop, pad: int, box_h: int):
+    """If the region sits on a solid-colour banner, return that colour (RGB);
+    else None (text on a photo / textured background).
 
-    以前的做法是把整個 bounding box 填滿當遮罩，大面積矩形修復會把方塊邊界外
-    的深色像素（例如緊鄰的公式）暈染進來，留下灰色殘影。改用 `_region_text_mask`
-    只遮住筆畫本身，inpaint 便能從字距間的乾淨背景取樣，結果乾淨許多。
+    雜誌標題常是「紅字＋白色色塊底」。若沿用整張圖的 inpaint，會把白色色塊
+    一起抹掉、換成周圍深色影像，導致 paste 階段誤判背景太暗而把紅字改成白字。
+    偵測到色塊底時，remove_text 改為直接用色塊顏色填滿整框（重建色塊），
+    paste 階段便會看到淺色背景、保留原本的字色。判定方式：文字以外的背景
+    像素若顏色夠一致（標準差低），即視為純色色塊。
+    """
+    import numpy as np
+
+    fg = _region_text_mask(crop, pad, box_h)
+    if fg is None:
+        return None
+    bg_mask = fg == 0
+    if bg_mask.sum() < 0.15 * fg.size:   # 幾乎全是文字 → 無從判斷背景
+        return None
+    bg_pix = crop[bg_mask]
+    if float(bg_pix.std(axis=0).mean()) > 22:   # 背景不一致 → 照片/紋理底
+        return None
+    return tuple(int(v) for v in np.median(bg_pix, axis=0))
+
+
+def _gradient_fill(rgb, box):
+    """Reconstruct a smooth (vertically graded) background across the box by
+    interpolating between the clean background strips just above and below it.
+    Returns an RGB patch (box_h × box_w × 3), or None if the surroundings are
+    not clean background (a photo / another text line sits in the strips).
+
+    大面積文字（整段介紹文、大標）疊在平滑漸層底（例如灰階雜誌背景）上時，
+    TELEA 會把邊緣顏色往內暈成塊狀接縫，純色填滿又會在漸層上留一塊平板。
+    改用「取框上下方各數列乾淨背景，逐列垂直內插」重建漸層，銜接自然。
+    """
+    import numpy as np
+
+    h, w = rgb.shape[:2]
+    x0, y0, x1, y1 = max(0, box[0]), max(0, box[1]), min(w, box[2]), min(h, box[3])
+    bw, bh = x1 - x0, y1 - y0
+    if bw < 2 or bh < 2:
+        return None
+    s = int(np.clip(bh // 6, 3, 24))            # 參考條厚度
+    top = rgb[max(0, y0 - s):y0, x0:x1].astype(np.float32)
+    bot = rgb[y1:min(h, y1 + s), x0:x1].astype(np.float32)
+    if top.size == 0 or bot.size == 0:
+        return None
+    # 上下參考條必須是乾淨背景（無文字/物件邊緣）：整條顏色變異要夠低。
+    if top.reshape(-1, 3).std(0).mean() > 18 or bot.reshape(-1, 3).std(0).mean() > 18:
+        return None
+    top_ref = np.median(top, axis=0)            # (bw, 3) 逐列代表色
+    bot_ref = np.median(bot, axis=0)
+    # 兩條參考色代表的是「條中心」的值（約在框外 s/2 處），而非框緣。內插
+    # 係數要對應到真實位置，否則填色的漸層範圍會比框稍寬、露出矩形接縫。
+    th = top.shape[0]                            # 實際可用的上條列數
+    bh_bot = bot.shape[0]
+    span = bh + th / 2 + bh_bot / 2
+    a0 = (th / 2) / span
+    a1 = (th / 2 + bh) / span
+    a = np.linspace(a0, a1, bh, dtype=np.float32)[:, None, None]
+    patch = (1 - a) * top_ref[None] + a * bot_ref[None]
+    return patch.astype(np.uint8)
+
+
+def remove_text(img: Image.Image, regions: list[Region]) -> Image.Image:
+    """Erase the original text (去除文字) so the translation can be drawn in.
+
+    Three cases per region:
+      * 純色色塊底（雜誌標題）→ 直接用色塊顏色填滿整框，重建色塊，讓
+        paste 階段看得到淺色背景、保留原字色（見 `_uniform_bg_color`）。
+      * 照片/紋理底 → 只遮住筆畫本身送 inpaint，避免整框矩形修復把鄰近
+        像素暈染成殘影。
+      * 公式或品牌 logo（`_untouched`）→ 完全不動。
     """
     import cv2
     import numpy as np
@@ -631,41 +844,67 @@ def remove_text(img: Image.Image, regions: list[Region]) -> Image.Image:
     h, w = bgr.shape[:2]
 
     mask = np.zeros((h, w), dtype=np.uint8)
+    banners: list[tuple[tuple[int, int, int, int], tuple[int, int, int]]] = []
+    grad_fills: list[tuple[tuple[int, int, int, int], "np.ndarray"]] = []
 
     for r in regions:
-        if r.is_formula:
+        if _untouched(r):
             continue
         x0, y0, x1, y1 = r.box
         box_h = y1 - y0
-        # 在方塊外圍留一圈 padding：一方面讓 `_region_text_mask` 有乾淨的邊界
-        # 環估計背景色，另一方面涵蓋 OCR 框略小時漏掉的筆畫毛邊。
+
+        # 先在「緊框」上判斷是否為純色色塊底：緊框整個落在色塊內，不會像
+        # 加了 padding 的裁切那樣把色塊外的深色背景一起納入而誤判為非純色。
+        tx0, ty0 = max(0, x0), max(0, y0)
+        tx1, ty1 = min(w, x1), min(h, y1)
+        ring_pad = int(np.clip(box_h // 8, 2, 8))
+        banner_rgb = _uniform_bg_color(rgb[ty0:ty1, tx0:tx1], ring_pad, box_h)
+        if banner_rgb is not None:
+            # 純色色塊：整框（略為外擴以蓋住抗鋸齒毛邊）填滿色塊色，
+            # 記下來稍後直接貼上（不進 inpaint 遮罩）。
+            fp = 4
+            banners.append(((max(0, x0 - fp), max(0, y0 - fp),
+                             min(w, x1 + fp), min(h, y1 + fp)), banner_rgb))
+            continue
+
+        # 平滑漸層底（大面積文字最需要）：用上下乾淨背景逐列內插重建漸層，
+        # 避免 TELEA 在大面積上暈成塊狀接縫。
+        fp = 3
+        gx0, gy0 = max(0, x0 - fp), max(0, y0 - fp)
+        gx1, gy1 = min(w, x1 + fp), min(h, y1 + fp)
+        patch = _gradient_fill(rgb, (gx0, gy0, gx1, gy1))
+        if patch is not None:
+            grad_fills.append(((gx0, gy0, gx1, gy1), patch))
+            continue
+
+        # 照片/紋理底：外圍留一圈 padding，一方面讓 `_region_text_mask` 有
+        # 乾淨的邊界環估計背景色，另一方面涵蓋 OCR 框略小時漏掉的筆畫毛邊。
         pad = int(np.clip(box_h // 4, 4, 16))
         cx0, cy0 = max(0, x0 - pad), max(0, y0 - pad)
         cx1, cy1 = min(w, x1 + pad), min(h, y1 + pad)
         fg = _region_text_mask(rgb[cy0:cy1, cx0:cx1], pad, box_h)
         if fg is None:
-            # 裁切區域太小無法估計 → 退回整框遮罩
-            cv2.rectangle(mask, (x0, y0), (x1, y1), 255, -1)
+            cv2.rectangle(mask, (x0, y0), (x1, y1), 255, -1)  # 太小 → 整框遮罩
         else:
             mask[cy0:cy1, cx0:cx1] = np.maximum(mask[cy0:cy1, cx0:cx1], fg)
 
-    # 公式區域必須原封不動：鄰近段落的遮罩（含膨脹）若疊到公式上，
-    # inpaint 會毀掉公式的一部分並留下模糊污漬，這裡強制清除該範圍的遮罩。
-    formula_m = np.zeros((h, w), dtype=np.uint8)
+    # 公式 / 品牌 logo 必須原封不動：鄰近段落的遮罩（含膨脹）若疊到其上，
+    # inpaint 會毀掉一部分並留下模糊污漬，這裡強制清除該範圍的遮罩。
+    protect_m = np.zeros((h, w), dtype=np.uint8)
     for r in regions:
-        if r.is_formula:
+        if _untouched(r):
             x0, y0, x1, y1 = r.box
-            formula_m[max(0, y0):max(0, y1), max(0, x0):max(0, x1)] = 255
-    mask[formula_m > 0] = 0
+            protect_m[max(0, y0):max(0, y1), max(0, x0):max(0, x1)] = 255
+    mask[protect_m > 0] = 0
 
-    # TELEA 修復會從遮罩「邊界」取樣：緊貼遮罩的公式深色筆畫（行內的
-    # 1/√dk、dk 等）會被暈進修復區，留下一條條拖影。修復前先把公式區域
-    # 暫時蓋成周圍背景色，全部修復完成後再把公式的原始像素貼回去。
+    # TELEA 修復會從遮罩「邊界」取樣：緊貼遮罩的保留像素（行內的 1/√dk、dk
+    # 等）會被暈進修復區，留下一條條拖影。修復前先把保留區域暫時蓋成周圍
+    # 背景色，全部修復完成後再把原始像素貼回去。
     work = bgr
-    if formula_m.any():
+    if protect_m.any():
         work = bgr.copy()
         for r in regions:
-            if not r.is_formula:
+            if not _untouched(r):
                 continue
             x0, y0, x1, y1 = r.box
             x0, y0 = max(0, x0), max(0, y0)
@@ -680,20 +919,35 @@ def remove_text(img: Image.Image, regions: list[Region]) -> Image.Image:
 
     radius = max(3, min(h, w) // 150)
     cleaned_bgr = (cv2.inpaint(work, mask, radius, cv2.INPAINT_TELEA)
-                   if mask.any() else work)
+                   if mask.any() else work.copy())
+
+    def _apply_fills():
+        # 重建純色色塊：直接用色塊顏色填滿整框（覆蓋原文字）。
+        for (bx0, by0, bx1, by1), color_rgb in banners:
+            cleaned_bgr[by0:by1, bx0:bx1] = color_rgb[::-1]  # RGB → BGR
+        # 重建平滑漸層：貼上逐列內插的背景（RGB → BGR）。
+        for (bx0, by0, bx1, by1), patch in grad_fills:
+            cleaned_bgr[by0:by1, bx0:bx1] = patch[:, :, ::-1]
+
+    _apply_fills()
+
+    # 已由色塊/漸層重建的像素，不需再做殘影檢查。
+    filled_m = np.zeros((h, w), dtype=np.uint8)
+    for (bx0, by0, bx1, by1), _ in banners + grad_fills:
+        filled_m[by0:by1, bx0:bx1] = 255
 
     # 清除品質檢查（無條件執行）：筆畫遮罩偶爾會低估粗筆畫（粗體標題最
     # 常見），inpaint 後留下讀得出來的鬼影；極端情況下遮罩甚至可能全空。
     # 逐區檢查修復結果，仍殘留高對比筆畫的區域退回「整框遮罩」再修一次
-    # （公式範圍照樣排除）。
+    # （保留 / 已重建區域照樣排除）。
     retry = np.zeros((h, w), dtype=np.uint8)
     for r in regions:
-        if r.is_formula:
+        if _untouched(r):
             continue
         x0, y0 = max(0, r.box[0]), max(0, r.box[1])
         x1, y1 = max(0, r.box[2]), max(0, r.box[3])
         crop = cleaned_bgr[y0:y1, x0:x1]
-        keep = formula_m[y0:y1, x0:x1] == 0   # 殘留量不計入公式像素
+        keep = (protect_m[y0:y1, x0:x1] == 0) & (filled_m[y0:y1, x0:x1] == 0)
         if crop.size == 0 or not keep.any():
             continue
         c = crop.astype(np.int16)
@@ -705,12 +959,14 @@ def remove_text(img: Image.Image, regions: list[Region]) -> Image.Image:
     if retry.any():
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
         retry = cv2.dilate(retry, kernel)
-        retry[formula_m > 0] = 0
+        retry[protect_m > 0] = 0
+        retry[filled_m > 0] = 0
         cleaned_bgr = cv2.inpaint(cleaned_bgr, retry, radius, cv2.INPAINT_TELEA)
+        _apply_fills()   # 重修後再蓋回色塊 / 漸層
 
-    # 把公式的原始像素貼回（前面為了避免拖影暫時用背景色蓋住了）。
-    if formula_m.any():
-        cleaned_bgr[formula_m > 0] = bgr[formula_m > 0]
+    # 把保留區域的原始像素貼回（前面為了避免拖影暫時用背景色蓋住了）。
+    if protect_m.any():
+        cleaned_bgr[protect_m > 0] = bgr[protect_m > 0]
 
     rgb = cv2.cvtColor(cleaned_bgr, cv2.COLOR_BGR2RGB)
     return Image.fromarray(rgb)
@@ -785,11 +1041,21 @@ def _luminance(c) -> float:
     return 0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2]
 
 
+def _color_dist(a, b) -> float:
+    """Euclidean distance in RGB. Used for the legibility check instead of a
+    pure luminance difference: a red title on a dark-green background has a
+    small *luminance* gap but a large *colour* gap, and it is perfectly
+    legible — so we should keep the original colour rather than flipping it
+    to white. Luminance alone wrongly flagged such designs as illegible.
+    """
+    return ((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 + (a[2] - b[2]) ** 2) ** 0.5
+
+
 def draw_ocr_overlay(img: Image.Image, regions: list[Region]) -> Image.Image:
     """Step 1 visual — draw the detected boxes + recognised text on the image.
 
-    Red = normal text (will be erased + translated). Green = detected as a
-    formula/equation and will be left completely untouched.
+    Red = normal text (will be erased + translated). Green = formula, left
+    untouched. Blue = brand masthead/logo, kept untranslated.
     """
     img = img.convert("RGB")
     draw = ImageDraw.Draw(img)
@@ -797,7 +1063,8 @@ def draw_ocr_overlay(img: Image.Image, regions: list[Region]) -> Image.Image:
         LATIN_FONT if os.path.exists(LATIN_FONT) else _pick_font_path("en"), 12)
     for r in regions:
         x0, y0 = r.box[0], r.box[1]
-        color = (16, 163, 74) if r.is_formula else (255, 0, 0)
+        color = ((37, 99, 235) if r.keep
+                 else (16, 163, 74) if r.is_formula else (255, 0, 0))
         draw.rectangle(r.box, outline=color, width=2)
         # Put the recognised text just above the box on a small chip.
         text = r.original
@@ -830,9 +1097,9 @@ def paste_translations(
     draw = ImageDraw.Draw(img)
 
     for r, style in zip(regions, styles):
-        if r.is_formula:
-            # Formula pixels were never erased either — leave them exactly
-            # as in the original image, don't draw anything over them.
+        if _untouched(r):
+            # Formula / brand-logo pixels were never erased either — leave
+            # them exactly as in the original image, don't draw over them.
             continue
 
         x0, y0, x1, y1 = r.box
@@ -842,10 +1109,14 @@ def paste_translations(
             draw.rectangle(r.box, outline=(37, 99, 235), width=1)
 
         # Auto-estimate the local background colour (on the cleaned image) and
-        # ensure the text stays readable against it.
+        # ensure the text stays readable against it. Use colour distance, not
+        # a luminance gap: a red title on dark green is legible (large colour
+        # gap) even though the luminance gap is small — keep the original
+        # colour. Only fall back to black/white when the colour is genuinely
+        # too close to the background to read.
         bg = _estimate_bg_color(img, r.box)
         text_color = style.color
-        if abs(_luminance(text_color) - _luminance(bg)) < 55:
+        if _color_dist(text_color, bg) < 75:
             text_color = (0, 0, 0) if _luminance(bg) > 128 else (255, 255, 255)
 
         # Preserve the original weight when choosing the font.

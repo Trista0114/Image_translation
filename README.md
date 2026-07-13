@@ -8,17 +8,20 @@
 
 整個 pipeline 分為四個步驟(可透過網頁 UI 或 `POST /steps` 檢視每個中間階段):
 
-1. **偵測文字** — 使用 PaddleOCR 在本地偵測每行文字與其邊界框(bounding box)。
-2. **抹除原文** — 使用 OpenCV inpainting 將原始文字從圖片中移除,保留背景。
+1. **偵測文字** — 使用 PaddleOCR 在本地偵測每行文字與其邊界框(bounding box),並過濾誤偵測(信心分數門檻、重複框去重)。
+2. **抹除原文** — 依背景類型選擇策略:純色色塊直接重建、平滑漸層逐列內插重建、照片紋理才使用 OpenCV inpainting(僅遮筆畫,避免暈染),並有殘影檢查重修機制。
 3. **翻譯** — 使用 deep-translator 的 `GoogleTranslator` 翻譯文字;會先將同一段落的行合併後再翻譯,讓譯文有完整的句子上下文。
-4. **重繪譯文** — 使用 Pillow 將譯文貼回原本的框內:自動以二分搜尋找出能塞進框內的最大字級、自動換行,並保留原文的顏色與粗細。
+4. **重繪譯文** — 使用 Pillow 將譯文貼回原本的框內:自動以二分搜尋找出能塞進框內的最大字級、CJK/拉丁混排斷行,並保留原文的顏色與粗細。
 
 ## 特色
 
 - **免 API key、免付費服務** — 本地 OCR + 免費翻譯端點。
-- **段落分組翻譯** — 合併屬於同一段落的 OCR 行,提升翻譯品質。
-- **數學公式保護** — 自動偵測看起來像公式/方程式的行,完整保留不翻譯、不抹除(overlay 中以綠框標示,一般文字為紅框)。
-- **樣式保留** — 取樣原文顏色、估計粗體字重,重繪時融合到局部背景中。
+- **段落分組翻譯** — 合併屬於同一段落的 OCR 行,提升翻譯品質;大標題與小字副標依字級差自動分開,不會被擠成一團。
+- **數學公式保護** — 自動偵測看起來像公式/方程式的行,完整保留不翻譯、不抹除;被 OCR 拆開的公式碎片(如分子、式號)會被吸收進公式一併保護(overlay 中以綠框標示)。
+- **品牌刊名保護** — 雜誌刊名(VOGUE、PSYCHOLOGIES…)等頂部大型品牌字自動辨識並原樣保留,不翻譯、不重繪(overlay 中以藍框標示,一般文字為紅框)。
+- **背景重建** — 文字底下是純色色塊或平滑漸層時,直接重建背景而非 inpaint,避免大面積修復的塊狀暈染。
+- **樣式保留** — 取樣原文顏色、估計粗體字重,重繪時融合到局部背景中;字色以色彩距離(而非亮度差)判斷易讀性,深色底上的紅色標題不會被誤改成白字。
+- **OCR 誤偵測過濾** — 依信心分數過濾照片紋理誤判(嘴唇、飾品高光),並對同一行字的重複偵測去重。
 - **跨平台字型** — 自動在 Windows / Linux / macOS 尋找可用的 CJK 與拉丁字型(微軟正黑體、Noto CJK、PingFang、Arial、DejaVu Sans 等)。
 - **可選 GPU** — 透過環境變數 `OCR_GPU` 啟用。
 
@@ -81,7 +84,7 @@ uvicorn translate_api:app --reload --port 8000
 ```bash
 # 回傳翻譯後的 PNG 圖片
 curl -X POST http://localhost:8000/translate \
-  -F "image=@test_image/Cover.jpeg" \
+  -F "image=@test_image/Cover_1.png" \
   -F "target_language=繁體中文" \
   -o translated.png
 
@@ -111,7 +114,7 @@ curl -X POST http://localhost:8000/translate \
 
 ## 測試
 
-本專案沒有自動化測試。可使用 `test_image/` 內的範例圖片(`Cover.jpeg`、`image5.jpg`),透過網頁 UI 或上方的 curl 範例手動驗證。
+使用 `test_image/` 內的範例圖片(雜誌封面 `Cover_*`、含公式論文 `formula_*`),透過網頁 UI 或上方的 curl 範例手動驗證;`Result/` 為代表性輸出結果,`test/` 為開發期間各輪迭代的測試截圖。
 
 ## 專案結構
 
@@ -119,7 +122,7 @@ curl -X POST http://localhost:8000/translate \
 pega_assign/
 ├── translate_api.py   # 完整服務(OCR、翻譯、重繪、API、網頁 UI)
 ├── requirements.txt   # Python 依賴
-└── test_image/        # 手動測試用範例圖片
-    ├── Cover.jpeg
-    └── image5.jpg
+├── test_image/        # 測試用來源圖片(雜誌封面、含公式論文)
+├── Result/            # 代表性翻譯結果(四步驟視覺化)
+└── test/              # 開發迭代過程的測試截圖
 ```
