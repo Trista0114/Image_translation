@@ -6,6 +6,11 @@
 使用方式: 上傳一張含有文字的圖片並指定目標語言,服務會辨識圖片中的所有文字、抹除原文,並將譯文以貼近原本樣式(位置、顏色、粗細)的方式重繪回圖片上。
 
 
+
+<img width="673" height="745" alt="messageImage_1783846081321" src="https://github.com/user-attachments/assets/7a87408f-5928-42e0-bd60-8a1a68949bcd" />
+
+
+
 ## 運作流程
 
 整個 pipeline 分為四個步驟(可透過網頁 UI 或 `POST /steps` 檢視每個中間階段):
