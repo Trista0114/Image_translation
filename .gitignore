@@ -23,3 +23,6 @@ translated.png
 # 公司招募資料與簡報草稿(不推上公開 repo,作業以 email 繳交)
 AI_Engineer_Job_intro_assignment_v4.pdf
 *.pptx
+
+# 開發迭代過程的測試截圖(僅留本機)
+test/

@@ -1,7 +1,7 @@
 # 圖片文字翻譯服務(Image Translation Service)
-本專案旨於熟悉AI native coding，全部作業內容使用claude code執行，目標Image為雜誌封面或是帶有公式的文獻內容。
+本專案旨在熟悉 AI native coding，全部作業內容使用 Claude Code 執行，目標 Image 為雜誌封面或是帶有公式的文獻內容。
 
-全程**不需要任何 API key**:OCR 在本地執行(PaddleOCR),翻譯使用 deep-translator 的 Google 免費端點(需要網路連線,但免金鑰)，無使用任何模型因此輸出結果不甚完美(尤其需要高判斷力的雜誌封面)，條件允許可以設計使用OCR+VLM或是使用可插拔設計(Gemini/Claude Api)來完善結果內容。
+全程**不需要任何 API key**:OCR 在本地執行(PaddleOCR),翻譯使用 deep-translator 的 Google 免費端點(需要網路連線,但免金鑰)。除本地 OCR 外未使用任何大型模型，因此輸出結果不甚完美(尤其需要高判斷力的雜誌封面)；條件允許可採用「OCR 管幾何 + VLM 管語意」的可插拔設計(Gemini / Claude API)來完善結果。
 
 使用方式: 上傳一張含有文字的圖片並指定目標語言,服務會辨識圖片中的所有文字、抹除原文,並將譯文以貼近原本樣式(位置、顏色、粗細)的方式重繪回圖片上。
 
@@ -116,7 +116,7 @@ curl -X POST http://localhost:8000/translate \
 
 ## 測試
 
-使用 `test_image/` 內的範例圖片(雜誌封面 `Cover_*`、含公式論文 `formula_*`),透過網頁 UI 或上方的 curl 範例手動驗證;`Result/` 為代表性輸出結果,`test/` 為開發期間各輪迭代的測試截圖。
+使用 `test_image/` 內的範例圖片(雜誌封面 `Cover_*`、含公式論文 `formula_*`),透過網頁 UI 或上方的 curl 範例手動驗證;`Result/` 為代表性輸出結果。
 
 ## 專案結構
 
@@ -125,6 +125,5 @@ pega_assign/
 ├── translate_api.py   # 完整服務(OCR、翻譯、重繪、API、網頁 UI)
 ├── requirements.txt   # Python 依賴
 ├── test_image/        # 測試用來源圖片(雜誌封面、含公式論文)
-├── Result/            # 代表性翻譯結果(四步驟視覺化)
-└── test/              # 開發迭代過程的測試截圖
+└── Result/            # 代表性翻譯結果(四步驟視覺化)
 ```
